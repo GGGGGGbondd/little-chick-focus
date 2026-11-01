@@ -43,3 +43,7 @@ Sessions are stored locally at `%LOCALAPPDATA%\LittleChickFocus\sessions.json`. 
 | `Esc` | Fold to the floating chick |
 | Left-click chick | Expand the main window |
 | Right-click chick | Open the daily records page |
+
+## 📜 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full version history — v1.0 first hatch → v1.1 deadline rewrite → v1.2 self-healing chick.
