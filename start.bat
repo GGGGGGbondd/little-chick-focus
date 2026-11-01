@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start "" pythonw "%~dp0focus.py"
+start "" "C:\Program Files\Python312\pythonw.exe" "%~dp0focus.py"

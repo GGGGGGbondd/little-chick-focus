@@ -5,7 +5,7 @@
 - 记录仍保存在 %LOCALAPPDATA%\\LittleChickFocus\\sessions.json。
 """
 import json, os, threading, time, webbrowser, http.server, sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, font as tkfont
@@ -29,10 +29,35 @@ def sp(v):
 APP_DIR = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'LittleChickFocus'
 APP_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = APP_DIR / 'sessions.json'
+ERROR_LOG = APP_DIR / 'error.log'
 HTML_FILE = Path(__file__).with_name('index.html')
 CHICK_PNG = Path(__file__).with_name('chick.png')
 CHICK_SMALL = Path(__file__).with_name('chick_small.png')
 PORT = 0
+
+
+# ---- 全局异常兜底：pythonw 无控制台，未捕获异常会无声退出，这里落盘日志 ----
+def _log_exception(exc_type, exc, tb):
+    try:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write('\n=== %s ===\n' % datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            traceback.print_exception(exc_type, exc, tb, file=f)
+    except Exception:
+        pass
+
+
+import traceback
+sys.excepthook = _log_exception
+
+# Tk 回调内的异常同样记录（默认只打印到 stderr，pythonw 下 sys.stderr 为 None 会二次崩溃）
+_orig_report = tk.Tk.report_callback_exception
+def _report_callback_exception(self, exc, val, tb):
+    _log_exception(exc, val, tb)
+    try:
+        _orig_report(self, exc, val, tb)
+    except Exception:
+        pass  # pythonw 无 stderr 时原始实现会抛 AttributeError，吞掉即可，绝不终止进程
+tk.Tk.report_callback_exception = _report_callback_exception
 
 # ---- 配色（方案3：黑白框架 + 淡黄点缀；GOLD 沿用旧名，实际为黑色主色） ----
 BG    = '#ffffff'
@@ -186,6 +211,14 @@ class App:
         self.paused = False
         self.wechat_seconds = 0
         self.last_sample = None
+        self.deadline = None            # 截止时刻 epoch；None = 纯正向计时
+        self._deadline_warned = set()   # 已提醒的截止标记（1h/30m/15m）
+        self._ot_warned = 0             # 超时后已提醒的 20min 档数
+        self._dl_placeholder = True
+        self._tick_count = 0
+        self._display_was_off = False   # 屏幕状态边沿检测：上一次是否已熄屏
+        self._boot_wall = None          # 系统启动的墙钟锚点（睡眠自愈用）
+        self._last_dw = 0               # 上一次 GetLastInputInfo dwTime（回绕补偿用）
         self._wx_active = False    # 当前是否处于微信前台
         self._wx_since = 0.0       # 本次进入微信前台的时间
         self._wx_warned = False    # 本次会话是否已提醒过 1 分钟
@@ -196,7 +229,14 @@ class App:
         self.task_text = None
         self._build_ui()
         self.create_bubble()
-        root.withdraw()
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        w = sp(420)
+        h = self.root.winfo_reqheight()
+        self.root.geometry(f'{w}x{h}+{(sw - w) // 2}+60')
+        self.root.deiconify()
+        self.root.attributes('-topmost', True)
+        self.root.lift()
         self.tick()
 
     # ---------- 主窗口 UI ----------
@@ -221,23 +261,30 @@ class App:
                              highlightcolor=GOLD)
         self.task.insert(0, '例如：阅读、写作、学习')
         self.task.configure(fg=MUTED)
-        self.task.pack(fill='x', padx=sp(18), pady=(0, sp(14)), ipady=sp(7))
+        self.task.pack(fill='x', padx=sp(18), pady=(0, sp(10)), ipady=sp(7))
         self.task.bind('<FocusIn>', self._clear_placeholder)
+        tk.Label(card, text='截止（可选）：填 21:00=到点 / 填 45 或 1.5h=专注多久',
+                 font=F_SMALL, bg=CARD, fg=MUTED).pack(anchor='w', padx=sp(18), pady=(0, sp(2)))
+        self.deadline_entry = tk.Entry(card, font=F_ENTRY, relief='flat', bg=CARD, fg=MUTED,
+                                       insertbackground=GOLD, highlightthickness=2, highlightbackground=LINE,
+                                       highlightcolor=GOLD)
+        self.deadline_entry.insert(0, '例如 21:00')
+        self.deadline_entry.pack(fill='x', padx=sp(18), pady=(0, sp(12)), ipady=sp(5))
+        self.deadline_entry.bind('<FocusIn>', self._clear_dl_placeholder)
         tk.Frame(card, bg=LINE, height=2).pack(fill='x', padx=sp(18))
 
         ring_box = tk.Frame(card, bg=CARD)
-        ring_box.pack(pady=(sp(10), sp(2)))
-        rs = sp(170)
+        ring_box.pack(pady=(sp(6), sp(2)))
+        rs = sp(135)
         self.ring = tk.Canvas(ring_box, width=rs, height=rs, bg=CARD, highlightthickness=0)
         self.ring.pack()
-        pad = sp(13)
+        pad = sp(10)
         bbox = (pad, pad, rs - pad, rs - pad)
-        self.ring.create_arc(*bbox, start=0, extent=359, style='arc', outline=CARD, width=sp(5))
-        self.arc = self.ring.create_arc(*bbox, start=-90, extent=0, style='arc', outline=GOLD, width=sp(8))
+        self.arc = self.ring.create_arc(*bbox, start=-90, extent=0, style='arc', outline=INK, width=sp(6))
         self.clock = tk.Label(ring_box, text='00:00:00', font=F_CLOCK, bg=CARD, fg=INK)
         self.clock.place(relx=0.5, rely=0.5, anchor='center')
         self.status = tk.Label(card, text='写好事项，点「开始专注」', font=F_SMALL, bg=CARD, fg=MUTED)
-        self.status.pack(pady=(0, sp(15)))
+        self.status.pack(pady=(0, sp(12)))
 
         # 主按钮（开始 / 暂停·继续 / 结束）
         self.btns = tk.Frame(shell, bg=BG)
@@ -271,6 +318,47 @@ class App:
             self.task.delete(0, 'end')
             self.task.configure(fg=INK)
             self._placeholder = False
+
+    def _clear_dl_placeholder(self, event=None):
+        if self._dl_placeholder:
+            self.deadline_entry.delete(0, 'end')
+            self.deadline_entry.configure(fg=INK)
+            self._dl_placeholder = False
+
+    def _parse_deadline(self):
+        """解析截止：'HH:MM'=截止时刻；'45'/'45min'=分钟；'1.5h'=小时。空/非法 → None"""
+        try:
+            if self._dl_placeholder:
+                return None
+            s = self.deadline_entry.get().strip()
+            if not s:
+                return None
+            import re
+            # 1) HH:MM → 截止时刻
+            m = re.match(r'^(\d{1,2}):(\d{1,2})$', s)
+            if m:
+                hh, mm = int(m.group(1)), int(m.group(2))
+                if not (0 <= hh < 24 and 0 <= mm < 60):
+                    return None
+                now = datetime.now()
+                hh24 = hh
+                if hh < 12 and now.hour >= 12:
+                    hh24 = hh + 12      # 现在是下午/晚上：9:00 自动理解为晚上 21:00
+                dl = now.replace(hour=hh24, minute=mm, second=0, microsecond=0)
+                if dl <= now:
+                    dl = dl + timedelta(days=1)   # 该时刻已过 → 视为明天
+                return dl.timestamp()
+            # 2) 小时：1.5h / 2小时
+            m = re.match(r'^(\d+(?:\.\d+)?)\s*(?:h|hr|小时)$', s, re.I)
+            if m:
+                return time.time() + float(m.group(1)) * 3600
+            # 3) 分钟：45min / 45分钟；纯数字 45 也按分钟
+            m = re.match(r'^(\d+(?:\.\d+)?)\s*(?:min|m|分钟)?$', s, re.I)
+            if m:
+                return time.time() + float(m.group(1)) * 60
+            return None
+        except Exception:
+            return None
 
     # ---------- 浮窗小鸡 ----------
     def create_bubble(self):
@@ -325,8 +413,13 @@ class App:
     def update_bubble(self):
         c = self._bubble_canvas
         if self.running:
-            total = self.elapsed + (int(time.time() - self.started) if not self.paused else 0)
-            t = self.fmt_short(total)
+            now_ts = time.time()
+            if self.deadline:
+                remaining = self.deadline - now_ts
+                t = self.fmt_short(max(0, remaining)) if remaining >= 0 else '+' + self.fmt_short(int(-remaining))
+            else:
+                total = self.elapsed + (int(now_ts - self.started) if not self.paused else 0)
+                t = self.fmt_short(total)
             w = tkfont.Font(font=F_PILL).measure(t) + sp(22)
             c.coords(self._pill, sp(58) - w / 2, sp(36), sp(58) + w / 2, sp(60))
             c.itemconfigure(self._pill, state='normal')
@@ -375,14 +468,17 @@ class App:
         self.running = True
         self.wechat_seconds = 0
         self.last_sample = time.monotonic()
+        self.deadline = self._parse_deadline()
+        self._deadline_warned = set()
+        self._ot_warned = 0
+        # 有截止时间：初始满黑圈（=全部剩余时间），随倒计时越变越少
+        self.ring.itemconfigure(self.arc, extent=359 if self.deadline else 0)
+        self.deadline_entry.configure(state='disabled')
         self._wx_active = False
         self._wx_since = 0.0
         self._wx_warned = False
         self._apply_controls()
-        self.bubble.attributes('-topmost', False)
-        self.bubble.withdraw()
-        self.root.attributes('-topmost', False)
-        self.root.lower()
+        self.collapse()   # 开始后自动退到小鸡球：隐藏主窗、显示浮窗，计时照常
 
     def _apply_controls(self):
         """按状态刷新按钮与提示文字：空闲 / 专注中 / 已暂停"""
@@ -435,39 +531,50 @@ class App:
         self.paused = False
         self._apply_controls()
 
-    def finish(self):
+    def finish(self, ended_at=None, quiet=False, note=''):
+        """结束本次专注并保存。ended_at: 自定义结束时间戳(秒)；quiet: 不弹提示框；note: 附加备注"""
         if not self.running:
             return
+        end_ts = int(ended_at) if ended_at else int(time.time())
         seconds = self.elapsed
         if not self.paused:
-            seconds += int(time.time() - self.started)
+            seconds += max(0, end_ts - int(self.started))
         self.elapsed = seconds
         self.running = False
         self.paused = False
         self.started = None
         self.task.configure(state='normal')
+        self.deadline = None
+        self._deadline_warned = set()
+        self._ot_warned = 0
+        self.deadline_entry.configure(state='normal')
         self._apply_controls()
         self.status.configure(text='记好啦，休息一下 🐣')
         items = load_sessions()
-        items.append({
+        rec = {
             'task': self.task_text or '',
             'start': datetime.fromtimestamp(self.session_start).isoformat(timespec='seconds'),
-            'end': datetime.now().isoformat(timespec='seconds'),
+            'end': datetime.fromtimestamp(end_ts).isoformat(timespec='seconds'),
             'seconds': seconds,
             'wechat_seconds': self.wechat_seconds,
             'wechat_minutes': round(self.wechat_seconds / 60, 1),
             'wechat_tracking': 'foreground-window',
-        })
+        }
+        if note:
+            rec['note'] = note
+        items.append(rec)
         save_sessions(items)
         self.started = None
         self.clock.configure(text=self.fmt(self.elapsed))
         self.ring.itemconfigure(self.arc, extent=0)
         self.update_bubble()
-        messagebox.showinfo('本次已记录', f'专注 {self.fmt(seconds)}，检测到微信在前台 {self.fmt(self.wechat_seconds)}。')
+        if not quiet:
+            messagebox.showinfo('本次已记录', f'专注 {self.fmt(seconds)}，检测到微信在前台 {self.fmt(self.wechat_seconds)}。')
         self.collapse()
 
     @staticmethod
     def fmt(n):
+        n = int(n)
         return f'{n // 3600:02d}:{n % 3600 // 60:02d}:{n % 60:02d}'
 
     @staticmethod
@@ -479,26 +586,71 @@ class App:
     def tick(self):
         if self.running and not self.paused:
             now = time.monotonic()
-            wx = self._wechat_is_foreground()
-            if wx:
-                # 每次打开微信：新会话开始计时，连续满 60 秒提醒一次
-                if not self._wx_active:
-                    self._wx_active = True
-                    self._wx_since = now
+            self._tick_count += 1
+            if self._tick_count % 4 == 0:   # 每 4 次 tick（约 1 秒）检测一次微信，减少高频子进程
+                wx = self._wechat_is_foreground()
+                if wx:
+                    # 每次打开微信：新会话开始计时，连续满 60 秒提醒一次
+                    if not self._wx_active:
+                        self._wx_active = True
+                        self._wx_since = now
+                        self._wx_warned = False
+                    elif not self._wx_warned and now - self._wx_since >= 60:
+                        self._wx_warned = True
+                        self._show_wx_warning()
+                    if self.last_sample is not None:
+                        self.wechat_seconds += min(now - self.last_sample, 2.0)
+                else:
+                    self._wx_active = False
                     self._wx_warned = False
-                elif not self._wx_warned and now - self._wx_since >= 60:
-                    self._wx_warned = True
-                    self._show_wx_warning()
-                if self.last_sample is not None:
-                    self.wechat_seconds += min(now - self.last_sample, 1.5)
-            else:
-                self._wx_active = False
-                self._wx_warned = False
-            self.last_sample = now
+                self.last_sample = now
             total = self.elapsed + int(time.time() - self.started)
-            self.clock.configure(text=self.fmt(total))
+            # 兜底：单次专注超过 10 小时 → 自动结束，截断到最后一次操作电脑的时间
+            if total >= 10 * 3600:
+                last = self._last_input_time()
+                ended = None
+                if last is not None:
+                    ended = max(int(last), int(self.session_start))
+                self.finish(ended_at=ended, quiet=True, note='超过10小时自动截断')
+                self.root.after(250, self.tick)
+                return
+            # 屏幕熄灭（约每 40 次 tick = 10 秒检查一次）→ 自动停止并保存
+            if self._tick_count % 40 == 0:
+                off = self._display_is_off()
+                if off and not self._display_was_off:
+                    self._display_was_off = True
+                    if self.running and not self.paused:
+                        self.finish(quiet=True, note='屏幕熄灭自动保存')
+                        self.root.after(250, self.tick)
+                        return
+                elif not off:
+                    self._display_was_off = False
+            now_ts = time.time()
+            if self.deadline:
+                remaining = self.deadline - now_ts
+                if remaining >= 0:
+                    clock_text = self.fmt(remaining)
+                    for name, sec in (('1h', 3600), ('30m', 1800), ('15m', 900)):
+                        if name not in self._deadline_warned and remaining <= sec:
+                            self._deadline_warned.add(name)
+                            self._show_deadline_warning(f'离截止还有 {self.fmt_short(remaining)}')
+                    span = max(1, self.deadline - self.session_start)
+                    frac = min(1.0, max(0.0, (now_ts - self.session_start) / span))
+                    arc_extent = (1 - frac) * 359   # 满圈=剩余时间，随时间越变越少
+                else:
+                    over = int(-remaining)
+                    clock_text = '+' + self.fmt_short(over)
+                    ticks = over // 1200   # 每超时 20 分钟提醒一次
+                    if ticks > self._ot_warned:
+                        self._ot_warned = ticks
+                        self._show_deadline_warning(f'已超时 {self.fmt_short(over)}，该收尾啦')
+                    arc_extent = 0   # 超时：圈已空
+            else:
+                clock_text = self.fmt(total)
+                arc_extent = (total % 3600) * 0.1
+            self.clock.configure(text=clock_text)
             self.wechat_status.configure(text=self.fmt(int(self.wechat_seconds)))
-            self.ring.itemconfigure(self.arc, extent=(total % 3600) * 0.1)
+            self.ring.itemconfigure(self.arc, extent=arc_extent)
             self.update_bubble()
         elif self.running and self.paused:
             self.clock.configure(text=self.fmt(self.elapsed))
@@ -523,6 +675,25 @@ class App:
         except Exception:
             pass
 
+    def _show_deadline_warning(self, msg):
+        """截止倒计时提醒：居中弹窗，点击或 10 秒自动关闭"""
+        try:
+            top = tk.Toplevel(self.root)
+            top.overrideredirect(True)
+            top.attributes('-topmost', True)
+            w, h = sp(380), sp(110)
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            top.geometry(f'{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}')
+            c = tk.Canvas(top, width=w, height=h, bg=CARD,
+                          highlightthickness=2, highlightbackground=LINE, highlightcolor=LINE)
+            c.pack(fill='both', expand=True)
+            c.create_text(w / 2, h / 2 - sp(14), text=msg, font=F_BTN, fill=INK)
+            c.create_text(w / 2, h / 2 + sp(16), text='点一下关闭', font=F_SMALL, fill=MUTED)
+            c.bind('<Button-1>', lambda e: top.destroy())
+            top.after(10000, top.destroy)
+        except Exception:
+            pass
+
     def _wechat_is_foreground(self):
         try:
             hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -537,11 +708,70 @@ class App:
         except Exception:
             return False
 
+    def _display_is_off(self):
+        """查询物理显示器电源状态：所有显示器都未激活(Active=False) = 屏幕已熄灭"""
+        try:
+            import subprocess
+            ps = ("$m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness; "
+                  "if ($m -eq $null) { 'unknown' } "
+                  "elseif (@($m | Where-Object { $_.Active }).Count -eq 0) { 'off' } else { 'on' }")
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace',
+                               timeout=8, creationflags=0x08000000)
+            lines = [l.strip().lower() for l in r.stdout.splitlines() if l.strip()]
+            return bool(lines) and lines[-1] == 'off'
+        except Exception:
+            return False
+
+    def _last_input_time(self):
+        """最后一次键盘/鼠标输入的时刻（epoch 秒）；失败返回 None。
+        用系统启动的墙钟锚点换算：睡眠(S3)时 GetTickCount 停走而墙钟继续，
+        直接 time.time()-idle 会在唤醒后失准，故锚点取历史最小值自愈。"""
+        try:
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.UINT), ('dwTime', wintypes.DWORD)]
+            lii = LASTINPUTINFO()
+            lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return None
+            dw = lii.dwTime
+            if self._last_dw is not None and dw < self._last_dw:
+                dw += 2 ** 32   # GetTickCount 49.7 天回绕补偿
+            self._last_dw = dw
+            boot = time.time() - ctypes.windll.kernel32.GetTickCount64() / 1000.0
+            if self._boot_wall is None or boot < self._boot_wall:
+                self._boot_wall = boot  # 取最小锚点：睡眠唤醒后 uptime 停滞会算出偏晚的 boot，丢弃
+            return self._boot_wall + dw / 1000.0
+        except Exception:
+            return None
+
     def open_page(self):
         webbrowser.open(f'http://127.0.0.1:{PORT}/')
 
 
+def _single_instance_lock():
+    """单实例锁：已有 focus.py 在运行则返回 False，本进程应直接退出。
+    用 PID 锁文件 + OpenProcess 存活检测，防止双击/守护拉起多个实例互相打架。"""
+    try:
+        lock = APP_DIR / 'focus.lock'
+        if lock.exists():
+            old = int(lock.read_text().strip())
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, old)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                code = ctypes.c_ulong()
+                ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                ctypes.windll.kernel32.CloseHandle(h)
+                if code.value == 259:  # STILL_ACTIVE
+                    return False
+        lock.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return True  # 锁机制异常时放行，不让正常功能被锁误伤
+
+
 if __name__ == '__main__':
+    if not _single_instance_lock():
+        sys.exit(0)  # 已有实例在运行，本实例直接退出
     start_server()
     root = tk.Tk()
     app = App(root)
