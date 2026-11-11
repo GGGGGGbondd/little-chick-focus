@@ -29,7 +29,10 @@ def sp(v):
 APP_DIR = Path(os.environ.get('LOCALAPPDATA', str(Path.home()))) / 'LittleChickFocus'
 APP_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = APP_DIR / 'sessions.json'
+WANDER_FILE = APP_DIR / 'wander.json'
 ERROR_LOG = APP_DIR / 'error.log'
+IDLE_LIMIT = int(os.environ.get('LITTLE_CHICK_IDLE_LIMIT', '60'))  # 键鼠空闲多少秒弹走神提醒（默认 1 分钟）
+PS_EXE = Path(r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe')  # 子进程调 PowerShell 的全路径（不依赖 PATH）
 HTML_FILE = Path(__file__).with_name('index.html')
 CHICK_PNG = Path(__file__).with_name('chick.png')
 CHICK_SMALL = Path(__file__).with_name('chick_small.png')
@@ -93,10 +96,50 @@ def save_sessions(items):
     DATA_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding='utf-8')
 
 
+# ---- 走神记录：键鼠空闲满 1 分钟时问一句"刚去哪儿了"，存档备查 ----
+def load_wander():
+    try:
+        return json.loads(WANDER_FILE.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_wander(items):
+    WANDER_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def wander_due(idle_seconds, already_warned, limit=None):
+    """本段空闲是否该弹走神提醒：未提醒过且空闲时长达到阈值"""
+    limit = IDLE_LIMIT if limit is None else limit
+    return (not already_warned) and idle_seconds >= limit
+
+
+def append_wander(task, at_ts, idle_seconds, note=''):
+    """追加一条走神记录并落盘；note 为空表示没填写"""
+    items = load_wander()
+    rec = {
+        'task': task or '',
+        'at': datetime.fromtimestamp(at_ts).isoformat(timespec='seconds'),
+        'idle_seconds': int(idle_seconds),
+        'note': note or '',
+    }
+    items.append(rec)
+    save_wander(items)
+    return rec
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith('/api/sessions'):
             body = json.dumps(load_sessions(), ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith('/api/wander'):
+            body = json.dumps(load_wander(), ensure_ascii=False).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -222,6 +265,9 @@ class App:
         self._wx_active = False    # 当前是否处于微信前台
         self._wx_since = 0.0       # 本次进入微信前台的时间
         self._wx_warned = False    # 本次会话是否已提醒过 1 分钟
+        self._idle_warned = False  # 本段键鼠空闲是否已弹过走神提醒
+        self._idle_popup = None    # 当前走神弹窗（避免重复弹出）
+        self._idle_popup_seconds = 0
         self.bubble = None
         self._drag_origin = None
         self._chick_img = None
@@ -477,6 +523,8 @@ class App:
         self._wx_active = False
         self._wx_since = 0.0
         self._wx_warned = False
+        self._idle_warned = False
+        self._close_idle_popup()
         self._apply_controls()
         self.collapse()   # 开始后自动退到小鸡球：隐藏主窗、显示浮窗，计时照常
 
@@ -535,6 +583,7 @@ class App:
         """结束本次专注并保存。ended_at: 自定义结束时间戳(秒)；quiet: 不弹提示框；note: 附加备注"""
         if not self.running:
             return
+        self._close_idle_popup()
         end_ts = int(ended_at) if ended_at else int(time.time())
         seconds = self.elapsed
         if not self.paused:
@@ -625,6 +674,16 @@ class App:
                         return
                 elif not off:
                     self._display_was_off = False
+            # 走神检测（约每 20 次 tick = 5 秒一次）：键鼠空闲满 1 分钟 → 弹窗问去哪儿了
+            if self._tick_count % 20 == 0:
+                last = self._last_input_time()
+                if last is not None:
+                    idle = time.time() - last
+                    if wander_due(idle, self._idle_warned):
+                        self._idle_warned = True
+                        self._show_wander_prompt(int(idle))
+                    elif idle < 60:
+                        self._idle_warned = False   # 用户回来了：本段空闲结束，下次重新计
             now_ts = time.time()
             if self.deadline:
                 remaining = self.deadline - now_ts
@@ -694,6 +753,70 @@ class App:
         except Exception:
             pass
 
+    def _close_idle_popup(self):
+        """关闭当前走神弹窗（若有）"""
+        if self._idle_popup is not None:
+            try:
+                self._idle_popup.destroy()
+            except Exception:
+                pass
+            self._idle_popup = None
+
+    def _show_wander_prompt(self, idle_seconds):
+        """键鼠空闲满阈值：居中弹窗问「走神去哪儿了」，可填写存档，也可直接跳过继续计时"""
+        try:
+            if self._idle_popup is not None:
+                try:
+                    if self._idle_popup.winfo_exists():
+                        self._idle_popup.lift()
+                        return
+                except Exception:
+                    pass
+                self._idle_popup = None
+            self._idle_popup_seconds = idle_seconds
+            top = tk.Toplevel(self.root)
+            self._idle_popup = top
+            top.title('走神提醒')
+            top.attributes('-topmost', True)
+            top.resizable(False, False)
+            top.configure(bg=BG)
+            w, h = sp(430), sp(176)
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            top.geometry(f'{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}')
+
+            body = tk.Frame(top, bg=BG)
+            body.pack(fill='both', expand=True, padx=sp(20), pady=sp(16))
+            tk.Label(body, text='走神啦！记录存档稍后再想吧',
+                     font=F_TITLE, bg=BG, fg=INK).pack(anchor='w', pady=(0, sp(12)))
+            entry = tk.Entry(body, font=F_BODY, relief='flat', bg=CARD, fg=INK,
+                             insertbackground=INK, highlightthickness=2,
+                             highlightbackground=LINE, highlightcolor=INK)
+            entry.pack(fill='x', ipady=sp(6))
+
+            btns = tk.Frame(body, bg=BG)
+            btns.pack(fill='x', pady=(sp(12), 0))
+            RoundedButton(btns, '继续专注', command=lambda: self._submit_wander(entry.get()),
+                          accent=True, font=F_BTN, padx=sp(10), pady=sp(9),
+                          stretch=True).pack(side='left', fill='x', expand=True)
+            tk.Frame(btns, bg=BG, width=sp(10)).pack(side='left')
+            RoundedButton(btns, '跳过', command=lambda: self._submit_wander(''),
+                          font=F_BTN, padx=sp(10), pady=sp(9),
+                          stretch=True).pack(side='left', fill='x', expand=True)
+
+            top.protocol('WM_DELETE_WINDOW', lambda: self._submit_wander(''))
+            entry.bind('<Return>', lambda e: self._submit_wander(entry.get()))
+            top.after(120, lambda: (top.lift(), top.focus_force(), entry.focus_set()))
+        except Exception:
+            self._idle_popup = None
+
+    def _submit_wander(self, note):
+        """存档走神记录并关闭弹窗；note 为空 = 未填写"""
+        try:
+            append_wander(self.task_text or '', time.time(), self._idle_popup_seconds, note)
+        except Exception:
+            pass
+        self._close_idle_popup()
+
     def _wechat_is_foreground(self):
         try:
             hwnd = ctypes.windll.user32.GetForegroundWindow()
@@ -715,7 +838,8 @@ class App:
             ps = ("$m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness; "
                   "if ($m -eq $null) { 'unknown' } "
                   "elseif (@($m | Where-Object { $_.Active }).Count -eq 0) { 'off' } else { 'on' }")
-            r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+            exe = str(PS_EXE) if PS_EXE.exists() else 'powershell'
+            r = subprocess.run([exe, '-NoProfile', '-Command', ps],
                                capture_output=True, text=True, encoding='utf-8', errors='replace',
                                timeout=8, creationflags=0x08000000)
             lines = [l.strip().lower() for l in r.stdout.splitlines() if l.strip()]

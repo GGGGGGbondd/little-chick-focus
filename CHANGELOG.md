@@ -2,6 +2,19 @@
 
 All the notable changes to Little Chick Focus — how the chick grew up, version by version.
 
+## [v1.3.0] — 2026-11-11 · The wander nudge
+
+### Added
+- **Wander nudge (走神提醒)** — during a focus session, one minute without keyboard or mouse pops a centered card: 「走神啦！记录存档稍后再想吧」. Write down where your mind went (Enter or 「继续专注」), or skip it (「跳过」 / the X). The timer never stops.
+- **Wander log (走神记录)** — a new section on the daily records page: time / task / idle seconds / note, newest first.
+- **`/api/wander`** — the records page reads `wander.json` through this local endpoint.
+
+### Changed
+- Idle detection now polls every 5 seconds (20 ticks), so a 1-minute threshold fires at 60–65s instead of being dragged to 70s.
+
+### Fixed
+- `_display_is_off()` calls PowerShell by its full System32 path — a Python subprocess PATH doesn't always include it, which could have silently disabled screen-off auto-save.
+
 ## [v1.2.0] — 2026-10-30 · The self-healing chick
 
 ### Added
